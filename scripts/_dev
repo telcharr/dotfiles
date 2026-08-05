@@ -1,0 +1,55 @@
+#compdef dev
+
+_dev_templates() {
+  local dots=${DOTFILES_DIR:-$HOME/dotfiles}
+  local -a shells
+  shells=(${(f)"$(find $dots/templates -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)"})
+  _describe 'shell' shells
+}
+
+_dev_composable() {
+  local dots=${DOTFILES_DIR:-$HOME/dotfiles}
+  local -a langs
+  langs=(${(f)"$(sed -n '/toolchains = {/,/^        };/p' $dots/templates/poly/flake.nix 2>/dev/null | sed -n 's/^[[:space:]]*\([a-z][a-z0-9_]*\) = with pkgs;.*/\1/p')"})
+  _describe 'language' langs
+}
+
+_dev_enabled() {
+  local -a langs
+  langs=(${(f)"$(sed -n 's/^[[:space:]]*enabled = \[\(.*\)\];[[:space:]]*$/\1/p' ./flake.nix 2>/dev/null | tr -d '\"' | tr ' ' '\n' | sed '/^$/d')"})
+  _describe 'enabled language' langs
+}
+
+_dev() {
+  local -a commands
+  commands=(
+    'list:available shells'
+    'which:active shell, direnv state, toolchain'
+    'doctor:diagnose why tooling is not working'
+    'init:scaffold flake.nix and .envrc here'
+    'adopt:add .envrc to an existing flake.nix'
+    'switch:replace this directory'\''s shell'
+    'add:add a language to a poly shell'
+    'rm:remove a language from a poly shell'
+    'allow:trust this directory'\''s .envrc'
+    'update:update this directory'\''s flake inputs'
+    'help:show usage'
+  )
+
+  local curcontext=$curcontext state line
+  _arguments -C '1:command:->cmd' '*::arg:->args'
+
+  case $state in
+    cmd) _describe 'command' commands ;;
+    args)
+      case $words[1] in
+        init | new) _dev_composable ;;
+        switch | use) _dev_templates ;;
+        add) _dev_composable ;;
+        rm | remove) _dev_enabled ;;
+      esac
+      ;;
+  esac
+}
+
+_dev "$@"

@@ -1,0 +1,521 @@
+DOTS="${DOTFILES_DIR:-$HOME/dotfiles}"
+TEMPLATES="$DOTS/templates"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  A=$'\033[38;2;255;92;0m'
+  D=$'\033[38;2;110;110;110m'
+  B=$'\033[1m'
+  R=$'\033[0m'
+else
+  A="" D="" B="" R=""
+fi
+
+die() {
+  printf '%sdev%s %s\n' "$A" "$R" "$*" >&2
+  exit 1
+}
+
+hint() {
+  printf '    %s%s%s\n' "$D" "$*" "$R" >&2
+}
+
+say() {
+  printf '%sdev%s %s\n' "$A" "$R" "$*"
+}
+
+field() {
+  printf '  %s%-10s%s %s\n' "$D" "$1" "$R" "$2"
+}
+
+list_templates() {
+  [ -d "$TEMPLATES" ] || die "no templates directory at $TEMPLATES"
+  find "$TEMPLATES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+composable() {
+  sed -n '/toolchains = {/,/^        };/p' "$TEMPLATES/poly/flake.nix" |
+    sed -n 's/^[[:space:]]*\([a-z][a-z0-9_]*\) = with pkgs;.*/\1/p'
+}
+
+is_template() {
+  list_templates | grep -qx -- "$1"
+}
+
+is_composable() {
+  composable | grep -qx -- "$1"
+}
+
+bins_for() {
+  case $1 in
+    rust) printf 'rustc cargo rust-analyzer rustfmt' ;;
+    go) printf 'go gopls dlv golangci-lint' ;;
+    python) printf 'python3 uv ruff basedpyright-langserver' ;;
+    cpp) printf 'clang clangd cmake ninja' ;;
+    lua) printf 'luajit lua-language-server stylua selene' ;;
+    node) printf 'node typescript-language-server biome' ;;
+    dotfiles) printf 'lua-language-server stylua nixd nixfmt statix deadnix' ;;
+    *) printf '' ;;
+  esac
+}
+
+markers_for() {
+  case $1 in
+    rust) printf 'Cargo.toml' ;;
+    go) printf 'go.mod' ;;
+    python) printf 'pyproject.toml setup.py setup.cfg requirements.txt' ;;
+    node) printf 'package.json' ;;
+    cpp) printf 'CMakeLists.txt compile_commands.json' ;;
+    *) printf '' ;;
+  esac
+}
+
+poly_langs() {
+  [ -f flake.nix ] || return 1
+  local raw
+  raw=$(sed -n 's/^[[:space:]]*enabled = \[\(.*\)\];[[:space:]]*$/\1/p' flake.nix)
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" | tr -d '"' | tr ' ' '\n' | sed '/^$/d'
+}
+
+is_poly() {
+  poly_langs >/dev/null 2>&1
+}
+
+dir_lang() {
+  [ -f flake.nix ] || return 1
+  local v
+  v=$(sed -n 's/^[[:space:]]*DEVSHELL = "\([a-z0-9_]*\)";.*/\1/p' flake.nix | head -1)
+  [ -n "$v" ] || return 1
+  printf '%s\n' "$v"
+}
+
+set_poly_langs() {
+  local list
+  list=$(printf '"%s" ' "$@")
+  sed -i "s|^\([[:space:]]*\)enabled = \[.*\];|\1enabled = [ ${list}];|" flake.nix
+}
+
+dedupe() {
+  awk 'NF && !seen[$0]++'
+}
+
+active_langs() {
+  if [ "${DEVSHELL:-}" = poly ] && is_poly; then
+    poly_langs
+  elif [ -n "${DEVSHELL:-}" ]; then
+    printf '%s\n' "$DEVSHELL"
+  fi
+}
+
+rc_state() {
+  direnv status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin)["state"]
+except Exception:
+    print("none"); raise SystemExit
+rc = s.get("foundRC")
+if not rc:
+    print("none")
+elif rc.get("allowed") == 0:
+    print("loaded" if s.get("loadedRC") else "allowed")
+else:
+    print("blocked")
+'
+}
+
+require_composable() {
+  local n
+  for n in "$@"; do
+    if [ "$n" = poly ]; then
+      printf '%sdev%s poly takes language names\n' "$A" "$R" >&2
+      hint "try: dev init $(composable | tr '\n' ' ' | sed 's/ *$//')"
+      exit 1
+    fi
+    if ! is_composable "$n"; then
+      printf '%sdev%s cannot combine %s\n' "$A" "$R" "$n" >&2
+      hint "combinable: $(composable | tr '\n' ' ' | sed 's/ *$//')"
+      [ -n "$(is_template "$n" && echo y)" ] && hint "'$n' works on its own: dev init $n"
+      exit 1
+    fi
+  done
+}
+
+reload_note() {
+  hint "cd out and back, or run 'direnv reload', to enter it"
+}
+
+write_single() {
+  cp -f "$TEMPLATES/$1/flake.nix" ./flake.nix
+  cp -f "$TEMPLATES/$1/.envrc" ./.envrc
+  direnv allow . 2>/dev/null || true
+  say "$1 shell ready"
+  reload_note
+}
+
+write_poly() {
+  cp -f "$TEMPLATES/poly/flake.nix" ./flake.nix
+  cp -f "$TEMPLATES/poly/.envrc" ./.envrc
+  set_poly_langs "$@"
+  direnv allow . 2>/dev/null || true
+  say "poly shell ready ($*)"
+  reload_note
+}
+
+LANGS=()
+FORCE=0
+FRESH=0
+
+split_flags() {
+  LANGS=()
+  FORCE=0
+  FRESH=0
+  local a
+  for a in "$@"; do
+    case $a in
+      -f | --force) FORCE=1 ;;
+      --fresh) FRESH=1 ;;
+      -*) die "unknown flag '$a'; try: dev help" ;;
+      *) LANGS+=("$a") ;;
+    esac
+  done
+}
+
+scaffold() {
+  local -a uniq
+  mapfile -t uniq < <(printf '%s\n' "${LANGS[@]}" | dedupe)
+  if [ ${#uniq[@]} -eq 1 ] && [ "${uniq[0]}" != poly ] && ! is_composable "${uniq[0]}"; then
+    is_template "${uniq[0]}" || die "unknown shell '${uniq[0]}'; try: dev list"
+    write_single "${uniq[0]}"
+  elif [ ${#uniq[@]} -eq 1 ] && [ "${uniq[0]}" != poly ]; then
+    write_single "${uniq[0]}"
+  else
+    require_composable "${uniq[@]}"
+    write_poly "${uniq[@]}"
+  fi
+}
+
+cmd_list() {
+  local active t
+  active=" $(active_langs | tr '\n' ' ')"
+  while IFS= read -r t; do
+    local summary
+    if [ "$t" = poly ]; then
+      summary="combine any of the others"
+    else
+      summary=$(bins_for "$t" | cut -d' ' -f1-3)
+    fi
+    if printf '%s' "$active" | grep -q " $t "; then
+      printf '%s* %-8s%s %s%s%s\n' "$A" "$t" "$R" "$D" "$summary" "$R"
+    else
+      printf '  %-8s %s%s%s\n' "$t" "$D" "$summary" "$R"
+    fi
+  done < <(list_templates)
+}
+
+cmd_which() {
+  local langs state
+  langs=$(active_langs | tr '\n' ' ' | sed 's/ *$//')
+
+  if [ "${DEVSHELL:-}" = poly ]; then
+    field "shell" "poly ${D}($langs)${R}"
+  else
+    field "shell" "${DEVSHELL:-none}"
+  fi
+
+  state=$(rc_state)
+  case $state in
+    blocked) field "direnv" "not trusted ${D}(dev allow)${R}" ;;
+    allowed) field "direnv" "allowed, not loaded ${D}(direnv reload)${R}" ;;
+    loaded) field "direnv" "loaded" ;;
+    *)
+      field "direnv" "no .envrc here ${D}(dev init <lang>)${R}"
+      if [ -n "${DEVSHELL:-}" ]; then
+        field "" "${A}shell above is inherited, not from this directory${R}"
+      fi
+      ;;
+  esac
+
+  [ -f flake.nix ] && field "flake" "$PWD/flake.nix"
+
+  local l b path
+  for l in $langs; do
+    for b in $(bins_for "$l"); do
+      if path=$(command -v "$b" 2>/dev/null); then
+        case $path in
+          /nix/store/*) printf '  %-10s %-27s %sdevshell%s\n' "" "$b" "$D" "$R" ;;
+          *) printf '  %-10s %-27s %ssystem%s\n' "" "$b" "$D" "$R" ;;
+        esac
+      else
+        printf '  %-10s %-27s %sMISSING%s\n' "" "$b" "$A" "$R"
+      fi
+    done
+  done
+}
+
+cmd_init() {
+  split_flags "$@"
+  [ ${#LANGS[@]} -ge 1 ] || die "which shell? try: dev list"
+
+  if [ -e flake.nix ]; then
+    printf '%sdev%s flake.nix already exists here\n' "$A" "$R" >&2
+    if [ -e .envrc ]; then
+      hint "already set up  ->  dev which"
+      hint "replace it      ->  dev switch ${LANGS[*]} -f"
+    else
+      hint "keep your flake ->  dev adopt"
+      hint "replace it      ->  dev switch ${LANGS[*]} -f"
+    fi
+    exit 1
+  fi
+
+  scaffold
+}
+
+cmd_adopt() {
+  [ -f flake.nix ] || die "no flake.nix here; try: dev init <lang>"
+  if [ -f .envrc ]; then
+    say ".envrc already present"
+  else
+    printf 'use flake\n' >.envrc
+    say "added .envrc for your existing flake"
+  fi
+  direnv allow .
+  reload_note
+}
+
+cmd_add() {
+  [ $# -ge 1 ] || die "which language? try: dev list"
+  [ -f flake.nix ] || die "no shell here; try: dev init $*"
+
+  local -a merged
+  if is_poly; then
+    require_composable "$@"
+    mapfile -t merged < <(
+      poly_langs
+      printf '%s\n' "$@"
+    )
+    mapfile -t merged < <(printf '%s\n' "${merged[@]}" | dedupe)
+    set_poly_langs "${merged[@]}"
+    direnv allow . 2>/dev/null || true
+    say "shell now: ${merged[*]}"
+    reload_note
+    return
+  fi
+
+  local cur
+  if ! cur=$(dir_lang); then
+    printf '%sdev%s this flake was not made by dev\n' "$A" "$R" >&2
+    hint "replace it: dev switch $* -f"
+    exit 1
+  fi
+
+  require_composable "$cur" "$@"
+  mapfile -t merged < <(
+    printf '%s\n' "$cur"
+    printf '%s\n' "$@"
+  )
+  mapfile -t merged < <(printf '%s\n' "${merged[@]}" | dedupe)
+
+  if [ -f flake.lock ]; then
+    hint "keeping flake.lock"
+  fi
+  [ "$cur" = rust ] && hint "note: poly uses nixpkgs rust, not the pinned rust-overlay toolchain"
+
+  write_poly "${merged[@]}"
+}
+
+cmd_rm() {
+  [ $# -ge 1 ] || die "which language?"
+  if ! is_poly; then
+    printf '%sdev%s this is a single-language shell%s\n' "$A" "$R" \
+      "$([ -n "$(dir_lang 2>/dev/null)" ] && printf ' (%s)' "$(dir_lang)")"
+    hint "nothing to remove from; use: dev switch <lang> -f"
+    exit 1
+  fi
+  local -a kept
+  mapfile -t kept < <(poly_langs | grep -vxF -f <(printf '%s\n' "$@") || true)
+  if [ ${#kept[@]} -eq 0 ]; then
+    printf '%sdev%s that removes every language\n' "$A" "$R" >&2
+    hint "to change shell entirely: dev switch <lang> -f"
+    exit 1
+  fi
+  set_poly_langs "${kept[@]}"
+  direnv allow . 2>/dev/null || true
+  say "shell now: ${kept[*]}"
+  reload_note
+}
+
+cmd_switch() {
+  split_flags "$@"
+  [ ${#LANGS[@]} -ge 1 ] || die "which shell? try: dev list"
+
+  if [ -e flake.nix ] && [ "$FORCE" -eq 0 ]; then
+    printf '%sdev%s this replaces flake.nix and .envrc here\n' "$A" "$R" >&2
+    hint "confirm: dev switch ${LANGS[*]} -f"
+    exit 1
+  fi
+
+  if [ "$FRESH" -eq 1 ]; then
+    rm -f flake.lock
+  elif [ -f flake.lock ]; then
+    hint "keeping flake.lock (--fresh discards it)"
+  fi
+
+  scaffold
+}
+
+cmd_allow() {
+  [ -f .envrc ] || die "no .envrc here; try: dev init <lang>"
+  direnv allow .
+  say "allowed"
+}
+
+cmd_update() {
+  [ -f flake.nix ] || die "no flake.nix here"
+  nix flake update
+}
+
+cmd_doctor() {
+  local problems=0
+
+  printf '%senvironment%s\n' "$B" "$R"
+  if [ -d "$TEMPLATES" ]; then
+    field "templates" "$TEMPLATES"
+  else
+    field "templates" "${A}missing at $TEMPLATES${R}"
+    problems=$((problems + 1))
+  fi
+  if command -v direnv >/dev/null 2>&1; then
+    field "direnv" "$(command -v direnv)"
+  else
+    field "direnv" "${A}not installed${R}"
+    problems=$((problems + 1))
+  fi
+
+  printf '\n%sthis directory%s\n' "$B" "$R"
+  if [ -f flake.nix ]; then
+    field "flake.nix" "present"
+  else
+    field "flake.nix" "${A}absent${R} ${D}(dev init <lang>)${R}"
+    problems=$((problems + 1))
+  fi
+
+  if [ -f .envrc ]; then
+    field ".envrc" "present"
+  else
+    field ".envrc" "${A}absent${R} ${D}(dev init <lang>, or dev adopt)${R}"
+    problems=$((problems + 1))
+  fi
+
+  case $(rc_state) in
+    loaded) field "direnv" "loaded" ;;
+    allowed)
+      field "direnv" "${A}allowed but not loaded${R} ${D}(direnv reload)${R}"
+      problems=$((problems + 1))
+      ;;
+    blocked)
+      field "direnv" "${A}not trusted${R} ${D}(dev allow)${R}"
+      problems=$((problems + 1))
+      ;;
+    *) field "direnv" "${D}nothing to load${R}" ;;
+  esac
+
+  if [ -n "${DEVSHELL:-}" ]; then
+    if [ -f .envrc ]; then
+      field "loaded" "$DEVSHELL"
+    else
+      field "loaded" "$DEVSHELL ${A}(inherited, not from here)${R}"
+    fi
+  else
+    field "loaded" "${A}no shell in this environment${R}"
+    problems=$((problems + 1))
+  fi
+
+  local langs l b m found
+  langs=$(active_langs | tr '\n' ' ')
+
+  if [ -n "$langs" ]; then
+    printf '\n%stoolchains%s\n' "$B" "$R"
+    local missing=0
+    for l in $langs; do
+      for b in $(bins_for "$l"); do
+        if ! command -v "$b" >/dev/null 2>&1; then
+          field "$l" "${A}$b missing${R}"
+          missing=$((missing + 1))
+          problems=$((problems + 1))
+        fi
+      done
+    done
+    [ "$missing" -eq 0 ] && field "" "${D}all present${R}"
+
+    local marker_out="" marker_bad=0
+    for l in $langs; do
+      m=$(markers_for "$l")
+      [ -n "$m" ] || continue
+      found=0
+      for b in $m; do
+        [ -e "$b" ] && found=1
+      done
+      if [ "$found" -eq 1 ]; then
+        marker_out="$marker_out$(field "$l" "ok")"$'\n'
+      else
+        marker_out="$marker_out$(field "$l" "${A}none of: $m${R}")"$'\n'
+        marker_bad=1
+        problems=$((problems + 1))
+      fi
+    done
+    if [ -n "$marker_out" ]; then
+      printf '\n%slsp root markers%s\n' "$B" "$R"
+      printf '%s' "$marker_out"
+      [ "$marker_bad" -eq 1 ] && hint "language servers may not attach without one of these"
+    fi
+  fi
+
+  printf '\n'
+  if [ "$problems" -eq 0 ]; then
+    say "no problems found"
+  else
+    say "$problems thing(s) to look at"
+  fi
+}
+
+usage() {
+  printf '%susage%s dev <command> [args]\n\n' "$B" "$R"
+  printf '  %-22s available shells, %s*%s marks active\n' "list" "$A" "$R"
+  printf '  %-22s active shell, direnv state, toolchain\n' "which"
+  printf '  %-22s diagnose why tooling is not working\n' "doctor"
+  printf '\n'
+  printf '  %-22s scaffold flake.nix + .envrc here\n' "init <lang>..."
+  printf '  %-22s add .envrc to a flake.nix you already have\n' "adopt"
+  printf '  %-22s replace this directory'\''s shell\n' "switch <lang>..."
+  printf '  %-22s add a language to a poly shell\n' "add <lang>..."
+  printf '  %-22s remove a language from a poly shell\n' "rm <lang>..."
+  printf '\n'
+  printf '  %-22s trust this directory'\''s .envrc\n' "allow"
+  printf '  %-22s update this directory'\''s flake inputs\n' "update"
+  printf '\n'
+  printf '%sflags%s  -f, --force   skip the replace confirmation\n' "$D" "$R"
+  printf '       --fresh       discard flake.lock on switch\n'
+}
+
+main() {
+  local cmd=${1:-which}
+  [ $# -gt 0 ] && shift
+  case $cmd in
+    list | ls) cmd_list "$@" ;;
+    which | status | st) cmd_which "$@" ;;
+    doctor | check) cmd_doctor "$@" ;;
+    init | new) cmd_init "$@" ;;
+    adopt) cmd_adopt "$@" ;;
+    switch | use) cmd_switch "$@" ;;
+    add) cmd_add "$@" ;;
+    rm | remove) cmd_rm "$@" ;;
+    allow | trust) cmd_allow "$@" ;;
+    update) cmd_update "$@" ;;
+    help | -h | --help) usage ;;
+    *) die "unknown command '$cmd'; try: dev help" ;;
+  esac
+}
+
+main "$@"
