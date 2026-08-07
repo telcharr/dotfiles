@@ -69,16 +69,78 @@ markers_for() {
   esac
 }
 
+SIDECAR=devshell.json
+
+spec_read() {
+  [ -f "$SIDECAR" ] || return 1
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+if isinstance(d, list):
+    d = {"languages": d, "packages": []}
+for x in d.get(sys.argv[2], []) or []:
+    print(x)
+' "$SIDECAR" "$1"
+}
+
+spec_write() {
+  local key=$1
+  shift
+  python3 -c '
+import json, os, sys
+path, key, vals = sys.argv[1], sys.argv[2], sys.argv[3:]
+d = {"languages": [], "packages": []}
+if os.path.exists(path):
+    try:
+        cur = json.load(open(path))
+        if isinstance(cur, list):
+            cur = {"languages": cur, "packages": []}
+        for k in ("languages", "packages"):
+            d[k] = list(cur.get(k) or [])
+    except Exception:
+        pass
+d[key] = vals
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+' "$SIDECAR" "$key" "$@"
+  track_sidecar
+}
+
+track_sidecar() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  git ls-files --error-unmatch "$SIDECAR" >/dev/null 2>&1 && return 0
+  if git add -N "$SIDECAR" 2>/dev/null; then
+    hint "git add -N $SIDECAR  (so nix can see it)"
+  fi
+}
+
 poly_langs() {
-  [ -f flake.nix ] || return 1
-  local raw
-  raw=$(sed -n 's/^[[:space:]]*enabled = \[\(.*\)\];[[:space:]]*$/\1/p' flake.nix)
-  [ -n "$raw" ] || return 1
-  printf '%s' "$raw" | tr -d '"' | tr ' ' '\n' | sed '/^$/d'
+  spec_read languages
+}
+
+poly_pkgs() {
+  spec_read packages
 }
 
 is_poly() {
-  poly_langs >/dev/null 2>&1
+  [ -f "$SIDECAR" ] && [ "$(dir_lang 2>/dev/null)" = poly ]
+}
+
+is_legacy_poly() {
+  [ -f flake.nix ] && [ ! -f "$SIDECAR" ] &&
+    grep -q '^[[:space:]]*enabled = \[' flake.nix
+}
+
+legacy_guard() {
+  if is_legacy_poly; then
+    printf '%sdev%s this poly shell predates devshell.json\n' "$A" "$R" >&2
+    hint "migrate: dev switch $(sed -n 's/^[[:space:]]*enabled = \[\(.*\)\];.*/\1/p' flake.nix | tr -d '"') -f"
+    exit 1
+  fi
 }
 
 dir_lang() {
@@ -90,9 +152,15 @@ dir_lang() {
 }
 
 set_poly_langs() {
-  local list
-  list=$(printf '"%s" ' "$@")
-  sed -i "s|^\([[:space:]]*\)enabled = \[.*\];|\1enabled = [ ${list}];|" flake.nix
+  spec_write languages "$@"
+}
+
+set_poly_pkgs() {
+  spec_write packages "$@"
+}
+
+validate_pkg() {
+  nix eval --raw "nixpkgs#$1.name" >/dev/null 2>&1
 }
 
 dedupe() {
@@ -156,6 +224,7 @@ write_single() {
 write_poly() {
   cp -f "$TEMPLATES/poly/flake.nix" ./flake.nix
   cp -f "$TEMPLATES/poly/.envrc" ./.envrc
+  rm -f "$SIDECAR"
   set_poly_langs "$@"
   direnv allow . 2>/dev/null || true
   say "poly shell ready ($*)"
@@ -285,6 +354,7 @@ cmd_adopt() {
 }
 
 cmd_add() {
+  legacy_guard
   [ $# -ge 1 ] || die "which language? try: dev list"
   [ -f flake.nix ] || die "no shell here; try: dev init $*"
 
@@ -326,6 +396,7 @@ cmd_add() {
 }
 
 cmd_rm() {
+  legacy_guard
   [ $# -ge 1 ] || die "which language?"
   if ! is_poly; then
     printf '%sdev%s this is a single-language shell%s\n' "$A" "$R" \
@@ -344,6 +415,60 @@ cmd_rm() {
   direnv allow . 2>/dev/null || true
   say "shell now: ${kept[*]}"
   reload_note
+}
+
+cmd_pkg() {
+  local sub=${1:-}
+  [ $# -gt 0 ] && shift
+  case $sub in
+    add)
+      [ $# -ge 1 ] || die "which package?"
+      legacy_guard
+      is_poly || die "packages need a poly shell; try: dev add <lang>"
+      local n
+      for n in "$@"; do
+        printf '%sdev%s checking %s in nixpkgs...\n' "$D" "$R" "$n"
+        validate_pkg "$n" || die "no such package '$n' in nixpkgs"
+      done
+      local -a merged
+      mapfile -t merged < <(
+        poly_pkgs
+        printf '%s\n' "$@"
+      )
+      mapfile -t merged < <(printf '%s\n' "${merged[@]}" | dedupe)
+      set_poly_pkgs "${merged[@]}"
+      direnv allow . 2>/dev/null || true
+      say "packages now: ${merged[*]}"
+      reload_note
+      ;;
+    rm | remove)
+      [ $# -ge 1 ] || die "which package?"
+      legacy_guard
+      is_poly || die "not a poly shell"
+      local -a kept
+      mapfile -t kept < <(poly_pkgs | grep -vxF -f <(printf '%s\n' "$@") || true)
+      set_poly_pkgs "${kept[@]}"
+      direnv allow . 2>/dev/null || true
+      if [ ${#kept[@]} -eq 0 ]; then
+        say "no extra packages"
+      else
+        say "packages now: ${kept[*]}"
+      fi
+      reload_note
+      ;;
+    list | ls | "")
+      legacy_guard
+      is_poly || die "not a poly shell"
+      local out
+      out=$(poly_pkgs)
+      if [ -z "$out" ]; then
+        say "no extra packages"
+      else
+        printf '%s\n' "$out" | sed 's/^/  /'
+      fi
+      ;;
+    *) die "unknown: dev pkg $sub; try add, rm, list" ;;
+  esac
 }
 
 cmd_switch() {
@@ -480,6 +605,119 @@ cmd_doctor() {
   fi
 }
 
+
+T_PASS=0
+T_FAIL=0
+
+t_ok() {
+  T_PASS=$((T_PASS + 1))
+  printf '  %-38s %sok%s\n' "$1" "$D" "$R"
+}
+
+t_no() {
+  T_FAIL=$((T_FAIL + 1))
+  printf '  %-38s %sFAIL%s  %s\n' "$1" "$A" "$R" "${2:-}"
+}
+
+t_check() {
+  local name=$1 expect=$2 got=$3
+  if [ "$expect" = "$got" ]; then t_ok "$name"; else t_no "$name" "want [$expect] got [$got]"; fi
+}
+
+cmd_selftest() {
+  SELFTEST_ROOT=$(mktemp -d)
+  local root=$SELFTEST_ROOT
+  trap 'rm -rf "$SELFTEST_ROOT"' EXIT
+  local here=$PWD
+
+  printf '%sscaffolding%s\n' "$B" "$R"
+
+  mkdir -p "$root/a" && cd "$root/a"
+  dev init go >/dev/null 2>&1 || true
+  t_check "init single writes flake+envrc" "yes" "$([ -f flake.nix ] && [ -f .envrc ] && echo yes)"
+  t_check "single shell has no sidecar" "yes" "$([ ! -f devshell.json ] && echo yes)"
+
+  mkdir -p "$root/b" && cd "$root/b"
+  dev init go python node >/dev/null 2>&1 || true
+  t_check "init poly writes sidecar" "go python node" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+
+  mkdir -p "$root/c" && cd "$root/c"
+  dev init go go python >/dev/null 2>&1 || true
+  t_check "duplicate languages deduped" "go python" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+
+  mkdir -p "$root/d" && cd "$root/d"
+  t_check "single 'poly' rejected" "1" "$(dev init poly >/dev/null 2>&1; echo $?)"
+  t_check "  ...left no files" "yes" "$([ ! -f flake.nix ] && echo yes)"
+
+  mkdir -p "$root/e" && cd "$root/e"
+  dev init rust -f >/dev/null 2>&1 || true
+  t_check "-f parsed as flag not language" "rust" "$(dir_lang 2>/dev/null)"
+
+  mkdir -p "$root/f" && cd "$root/f"
+  t_check "unknown language rejected" "1" "$(dev init go haskell >/dev/null 2>&1; echo $?)"
+  t_check "  ...left no files" "yes" "$([ ! -f flake.nix ] && echo yes)"
+
+  printf '\n%sdestructive guards%s\n' "$B" "$R"
+
+  mkdir -p "$root/g" && cd "$root/g"
+  printf '{ outputs = _: {}; }\n' >flake.nix
+  dev init rust >/dev/null 2>&1 || true
+  t_check "init refuses over existing flake" "{ outputs = _: {}; }" "$(cat flake.nix)"
+
+  mkdir -p "$root/h" && cd "$root/h"
+  dev init go >/dev/null 2>&1 || true
+  printf 'KEEP\n' >flake.lock
+  dev switch python -f >/dev/null 2>&1 || true
+  t_check "switch preserves flake.lock" "KEEP" "$(cat flake.lock 2>/dev/null)"
+  dev switch python -f --fresh >/dev/null 2>&1 || true
+  t_check "switch --fresh discards lock" "gone" "$([ ! -f flake.lock ] && echo gone)"
+
+  mkdir -p "$root/i" && cd "$root/i"
+  printf '{ description = "mine"; outputs = _: {}; }\n' >flake.nix
+  dev adopt >/dev/null 2>&1 || true
+  t_check "adopt adds envrc" "use flake" "$(cat .envrc 2>/dev/null)"
+  t_check "adopt leaves flake alone" "yes" "$(grep -q 'description = "mine"' flake.nix && echo yes)"
+
+  printf '\n%ssidecar%s\n' "$B" "$R"
+
+  mkdir -p "$root/j" && cd "$root/j"
+  dev init go >/dev/null 2>&1 || true
+  dev add python >/dev/null 2>&1 || true
+  t_check "add upgrades single to poly" "go python" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+  dev add python >/dev/null 2>&1 || true
+  t_check "add is idempotent" "go python" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+  dev rm python >/dev/null 2>&1 || true
+  t_check "rm works" "go" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+  t_check "rm of last language refused" "1" "$(dev rm go >/dev/null 2>&1; echo $?)"
+
+  nixfmt flake.nix >/dev/null 2>&1 || true
+  t_check "survives nixfmt on flake.nix" "go" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+
+  set_poly_pkgs ffmpeg jq
+  t_check "packages round-trip" "ffmpeg jq" "$(poly_pkgs | tr '\n' ' ' | sed 's/ *$//')"
+  t_check "  ...languages untouched" "go" "$(poly_langs | tr '\n' ' ' | sed 's/ *$//')"
+  set_poly_langs go rust
+  t_check "  ...packages survive lang write" "ffmpeg jq" "$(poly_pkgs | tr '\n' ' ' | sed 's/ *$//')"
+
+  mkdir -p "$root/k" && cd "$root/k" && git init -q .
+  dev init go python >/dev/null 2>&1 || true
+  t_check "sidecar git-tracked in a repo" "yes" "$(git ls-files | grep -qx devshell.json && echo yes)"
+
+  printf '\n%slegacy%s\n' "$B" "$R"
+  mkdir -p "$root/l" && cd "$root/l"
+  printf '{\n  enabled = [ "go" "rust" ];\n}\n' >flake.nix
+  t_check "legacy inline flake detected" "1" "$(dev add python >/dev/null 2>&1; echo $?)"
+
+  cd "$here"
+  printf '\n'
+  if [ "$T_FAIL" -eq 0 ]; then
+    say "$T_PASS passed, 0 failed"
+  else
+    say "$T_PASS passed, ${A}$T_FAIL failed${R}"
+    return 1
+  fi
+}
+
 usage() {
   printf '%susage%s dev <command> [args]\n\n' "$B" "$R"
   printf '  %-22s available shells, %s*%s marks active\n' "list" "$A" "$R"
@@ -491,6 +729,7 @@ usage() {
   printf '  %-22s replace this directory'\''s shell\n' "switch <lang>..."
   printf '  %-22s add a language to a poly shell\n' "add <lang>..."
   printf '  %-22s remove a language from a poly shell\n' "rm <lang>..."
+  printf '  %-22s add/rm/list extra nixpkgs packages\n' "pkg <add|rm|list>"
   printf '\n'
   printf '  %-22s trust this directory'\''s .envrc\n' "allow"
   printf '  %-22s update this directory'\''s flake inputs\n' "update"
@@ -510,9 +749,11 @@ main() {
     adopt) cmd_adopt "$@" ;;
     switch | use) cmd_switch "$@" ;;
     add) cmd_add "$@" ;;
+    pkg | pkgs) cmd_pkg "$@" ;;
     rm | remove) cmd_rm "$@" ;;
     allow | trust) cmd_allow "$@" ;;
     update) cmd_update "$@" ;;
+    selftest) cmd_selftest "$@" ;;
     help | -h | --help) usage ;;
     *) die "unknown command '$cmd'; try: dev help" ;;
   esac

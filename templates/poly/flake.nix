@@ -10,7 +10,9 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        enabled = [ "rust" ];
+        spec = builtins.fromJSON (builtins.readFile ./devshell.json);
+        enabled = spec.languages or [ ];
+        extra = spec.packages or [ ];
 
         toolchains = {
           rust = with pkgs; [
@@ -57,7 +59,7 @@
       {
         devShells.default = pkgs.mkShell {
           DEVSHELL = "poly";
-          packages = builtins.concatMap (n: toolchains.${n}) enabled;
+          packages = builtins.concatMap (n: toolchains.${n}) enabled ++ map (n: pkgs.${n}) extra;
         };
       }
     );

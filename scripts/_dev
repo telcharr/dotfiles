@@ -16,8 +16,22 @@ _dev_composable() {
 
 _dev_enabled() {
   local -a langs
-  langs=(${(f)"$(sed -n 's/^[[:space:]]*enabled = \[\(.*\)\];[[:space:]]*$/\1/p' ./flake.nix 2>/dev/null | tr -d '\"' | tr ' ' '\n' | sed '/^$/d')"})
+  langs=(${(f)"$(python3 -c 'import json,sys
+try: d=json.load(open("devshell.json"))
+except Exception: raise SystemExit
+if isinstance(d,list): d={"languages":d}
+print("\n".join(d.get("languages") or []))' 2>/dev/null)"})
   _describe 'enabled language' langs
+}
+
+_dev_pkgs() {
+  local -a pkgs
+  pkgs=(${(f)"$(python3 -c 'import json,sys
+try: d=json.load(open("devshell.json"))
+except Exception: raise SystemExit
+if isinstance(d,list): raise SystemExit
+print("\n".join(d.get("packages") or []))' 2>/dev/null)"})
+  _describe 'package' pkgs
 }
 
 _dev() {
@@ -31,8 +45,10 @@ _dev() {
     'switch:replace this directory'\''s shell'
     'add:add a language to a poly shell'
     'rm:remove a language from a poly shell'
+    'pkg:add, remove or list extra nixpkgs packages'
     'allow:trust this directory'\''s .envrc'
     'update:update this directory'\''s flake inputs'
+    'selftest:run the built-in test suite'
     'help:show usage'
   )
 
@@ -47,6 +63,13 @@ _dev() {
         switch | use) _dev_templates ;;
         add) _dev_composable ;;
         rm | remove) _dev_enabled ;;
+        pkg | pkgs)
+          if (( CURRENT == 2 )); then
+            _values 'subcommand' 'add[add a package]' 'rm[remove a package]' 'list[list packages]'
+          elif [[ $words[2] == (rm|remove) ]]; then
+            _dev_pkgs
+          fi
+          ;;
       esac
       ;;
   esac
