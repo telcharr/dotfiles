@@ -40,6 +40,7 @@ _dev() {
     'list:available shells'
     'which:active shell, direnv state, toolchain'
     'doctor:diagnose why tooling is not working'
+    'shell:enter a shell without writing anything here'
     'init:scaffold flake.nix and .envrc here'
     'adopt:add .envrc to an existing flake.nix'
     'switch:replace this directory'\''s shell'
@@ -59,6 +60,7 @@ _dev() {
     cmd) _describe 'command' commands ;;
     args)
       case $words[1] in
+        shell) _dev_templates ;;
         init | new) _dev_composable ;;
         switch | use) _dev_templates ;;
         add) _dev_composable ;;

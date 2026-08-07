@@ -107,15 +107,20 @@ with open(path, "w") as f:
     json.dump(d, f, indent=2)
     f.write("\n")
 ' "$SIDECAR" "$key" "$@"
-  track_sidecar
+  git_track "$SIDECAR"
 }
 
-track_sidecar() {
+git_track() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
-  git ls-files --error-unmatch "$SIDECAR" >/dev/null 2>&1 && return 0
-  if git add -N "$SIDECAR" 2>/dev/null; then
-    hint "git add -N $SIDECAR  (so nix can see it)"
+  git ls-files --error-unmatch "$1" >/dev/null 2>&1 && return 0
+  if git add -N "$1" 2>/dev/null; then
+    hint "git add -N $1  (so nix can see it)"
   fi
+}
+
+in_repo_note() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  hint "not your repo? dev shell $*  (writes nothing)"
 }
 
 poly_langs() {
@@ -168,7 +173,9 @@ dedupe() {
 }
 
 active_langs() {
-  if [ "${DEVSHELL:-}" = poly ] && is_poly; then
+  if [ -n "${DEV_LANGS:-}" ]; then
+    printf '%s\n' "$DEV_LANGS" | tr ' ' '\n'
+  elif [ "${DEVSHELL:-}" = poly ] && is_poly; then
     poly_langs
   elif [ -n "${DEVSHELL:-}" ]; then
     printf '%s\n' "$DEVSHELL"
@@ -218,6 +225,8 @@ write_single() {
   cp -f "$TEMPLATES/$1/.envrc" ./.envrc
   direnv allow . 2>/dev/null || true
   say "$1 shell ready"
+  git_track flake.nix
+  in_repo_note "$1"
   reload_note
 }
 
@@ -228,7 +237,31 @@ write_poly() {
   set_poly_langs "$@"
   direnv allow . 2>/dev/null || true
   say "poly shell ready ($*)"
+  git_track flake.nix
+  in_repo_note "$@"
   reload_note
+}
+
+# copies the template out to a cache dir rather than pointing nix at
+# ~/dotfiles/templates directly. nix writes flake.lock next to the flake and
+# git-adds it, which would dirty the dotfiles repo on every invocation.
+shell_dir() {
+  local -a langs
+  mapfile -t langs < <(printf '%s\n' "$@" | sort -u)
+
+  local dir
+  if [ ${#langs[@]} -eq 1 ]; then
+    dir="${XDG_CACHE_HOME:-$HOME/.cache}/dev/${langs[0]}"
+    mkdir -p "$dir"
+    cp -f "$TEMPLATES/${langs[0]}/flake.nix" "$dir/flake.nix"
+  else
+    dir="${XDG_CACHE_HOME:-$HOME/.cache}/dev/poly-$(printf '%s-' "${langs[@]}" | sed 's/-$//')"
+    mkdir -p "$dir"
+    cp -f "$TEMPLATES/poly/flake.nix" "$dir/flake.nix"
+    printf '{\n  "languages": [%s],\n  "packages": []\n}\n' \
+      "$(printf '"%s",' "${langs[@]}" | sed 's/,$//')" >"$dir/devshell.json"
+  fi
+  printf '%s\n' "$dir"
 }
 
 LANGS=()
@@ -298,9 +331,13 @@ cmd_which() {
     allowed) field "direnv" "allowed, not loaded ${D}(direnv reload)${R}" ;;
     loaded) field "direnv" "loaded" ;;
     *)
-      field "direnv" "no .envrc here ${D}(dev init <lang>)${R}"
-      if [ -n "${DEVSHELL:-}" ]; then
-        field "" "${A}shell above is inherited, not from this directory${R}"
+      if [ -n "${DEV_LANGS:-}" ]; then
+        field "direnv" "${D}ephemeral shell, no .envrc${R}"
+      else
+        field "direnv" "no .envrc here ${D}(dev init <lang>)${R}"
+        if [ -n "${DEVSHELL:-}" ]; then
+          field "" "${A}shell above is inherited, not from this directory${R}"
+        fi
       fi
       ;;
   esac
@@ -351,6 +388,24 @@ cmd_adopt() {
   fi
   direnv allow .
   reload_note
+}
+
+cmd_shell() {
+  [ $# -ge 1 ] || die "which shell? try: dev list"
+
+  local -a langs
+  mapfile -t langs < <(printf '%s\n' "$@" | dedupe)
+
+  if [ ${#langs[@]} -eq 1 ] && [ "${langs[0]}" != poly ]; then
+    is_template "${langs[0]}" || die "unknown shell '${langs[0]}'; try: dev list"
+  else
+    require_composable "${langs[@]}"
+  fi
+
+  local dir
+  dir=$(shell_dir "${langs[@]}")
+  say "${langs[*]} shell, ephemeral"
+  DEV_LANGS="${langs[*]}" exec nix develop "$dir" --command "${SHELL:-bash}"
 }
 
 cmd_add() {
@@ -702,6 +757,32 @@ cmd_selftest() {
   mkdir -p "$root/k" && cd "$root/k" && git init -q .
   dev init go python >/dev/null 2>&1 || true
   t_check "sidecar git-tracked in a repo" "yes" "$(git ls-files | grep -qx devshell.json && echo yes)"
+  t_check "poly flake git-tracked in a repo" "yes" "$(git ls-files | grep -qx flake.nix && echo yes)"
+
+  mkdir -p "$root/m" && cd "$root/m" && git init -q .
+  dev init rust >/dev/null 2>&1 || true
+  t_check "single flake git-tracked in a repo" "yes" "$(git ls-files | grep -qx flake.nix && echo yes)"
+
+  printf '\n%sephemeral shells%s\n' "$B" "$R"
+
+  mkdir -p "$root/n" && cd "$root/n"
+  export XDG_CACHE_HOME="$root/cache"
+  local d
+  d=$(shell_dir rust)
+  t_check "single dir keyed by language" "$root/cache/dev/rust" "$d"
+  t_check "  ...carries the rust template" "yes" "$(grep -q rust-overlay "$d/flake.nix" && echo yes)"
+  t_check "  ...no sidecar" "yes" "$([ ! -f "$d/devshell.json" ] && echo yes)"
+
+  d=$(shell_dir python go)
+  t_check "poly dir key is sorted" "$root/cache/dev/poly-go-python" "$d"
+  t_check "  ...sidecar lists both" "go python" "$(cd "$d" && spec_read languages | tr '\n' ' ' | sed 's/ *$//')"
+  t_check "  ...arg order shares one cache dir" "$d" "$(shell_dir go python)"
+  t_check "wrote nothing into cwd" "yes" "$([ ! -e flake.nix ] && [ ! -e .envrc ] && [ ! -e devshell.json ] && echo yes)"
+
+  t_check "shell with no args rejected" "1" "$(dev shell >/dev/null 2>&1; echo $?)"
+  t_check "shell poly rejected" "1" "$(dev shell poly >/dev/null 2>&1; echo $?)"
+  t_check "shell unknown language rejected" "1" "$(dev shell haskell >/dev/null 2>&1; echo $?)"
+  unset XDG_CACHE_HOME
 
   printf '\n%slegacy%s\n' "$B" "$R"
   mkdir -p "$root/l" && cd "$root/l"
@@ -724,6 +805,7 @@ usage() {
   printf '  %-22s active shell, direnv state, toolchain\n' "which"
   printf '  %-22s diagnose why tooling is not working\n' "doctor"
   printf '\n'
+  printf '  %-22s enter a shell without writing anything here\n' "shell <lang>..."
   printf '  %-22s scaffold flake.nix + .envrc here\n' "init <lang>..."
   printf '  %-22s add .envrc to a flake.nix you already have\n' "adopt"
   printf '  %-22s replace this directory'\''s shell\n' "switch <lang>..."
@@ -746,6 +828,7 @@ main() {
     which | status | st) cmd_which "$@" ;;
     doctor | check) cmd_doctor "$@" ;;
     init | new) cmd_init "$@" ;;
+    shell) cmd_shell "$@" ;;
     adopt) cmd_adopt "$@" ;;
     switch | use) cmd_switch "$@" ;;
     add) cmd_add "$@" ;;
