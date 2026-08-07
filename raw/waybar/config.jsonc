@@ -44,11 +44,14 @@
   },
 
   "custom/media": {
-    "exec": "playerctl -f '{{status}}|{{artist}} — {{title}}' metadata 2>/dev/null | sed -n 's/^Playing|//p' | cut -c1-38",
-    "interval": 5,
+    "exec": "$HOME/.config/waybar/scripts/media.py",
+    "return-type": "json",
     "hide-empty-text": true,
     "tooltip": false,
-    "on-click": "playerctl play-pause"
+    "on-click": "playerctl --player=playerctld,%any play-pause",
+    "on-click-middle": "playerctl --player=playerctld,%any next",
+    "on-scroll-up": "playerctl --player=playerctld,%any previous",
+    "on-scroll-down": "playerctl --player=playerctld,%any next"
   },
 
   "custom/updates": {
