@@ -121,6 +121,7 @@ in
     "waybar".source = config.lib.file.mkOutOfStoreSymlink "${dots}/raw/waybar";
     "foot".source = config.lib.file.mkOutOfStoreSymlink "${dots}/raw/foot";
     "nvim".source = config.lib.file.mkOutOfStoreSymlink "${dots}/raw/nvim";
+    "zed".source = config.lib.file.mkOutOfStoreSymlink "${dots}/raw/zed";
   };
 
   gtk = {
