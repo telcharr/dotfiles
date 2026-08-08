@@ -118,6 +118,16 @@ git_track() {
   fi
 }
 
+git_exclude() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local ex
+  ex=$(git rev-parse --git-path info/exclude) || return 0
+  mkdir -p "$(dirname "$ex")"
+  grep -qxF -- "$1" "$ex" 2>/dev/null && return 0
+  printf '%s\n' "$1" >>"$ex"
+  hint "excluded $1 via .git/info/exclude"
+}
+
 in_repo_note() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
   hint "not your repo? dev shell $*  (writes nothing)"
@@ -342,7 +352,13 @@ cmd_which() {
       ;;
   esac
 
-  [ -f flake.nix ] && field "flake" "$PWD/flake.nix"
+  if [ -f flake.nix ]; then
+    field "flake" "$PWD/flake.nix"
+  elif [ -f .envrc ]; then
+    local out
+    out=$(sed -n 's|^use flake \(/.*\)$|\1|p' .envrc | head -1)
+    [ -n "$out" ] && field "flake" "$out/flake.nix ${D}(attached)${R}"
+  fi
 
   local l b path
   for l in $langs; do
@@ -406,6 +422,36 @@ cmd_shell() {
   dir=$(shell_dir "${langs[@]}")
   say "${langs[*]} shell, ephemeral"
   DEV_LANGS="${langs[*]}" exec nix develop "$dir" --command "${SHELL:-bash}"
+}
+
+# the flake lives out of tree because nix only sees git-tracked files, so an
+# in-worktree flake.nix would have to be staged to work at all. .envrc is never
+# read by nix, so it can sit in .git/info/exclude instead.
+cmd_attach() {
+  split_flags "$@"
+  [ ${#LANGS[@]} -ge 1 ] || die "which shell? try: dev list"
+
+  local -a uniq
+  mapfile -t uniq < <(printf '%s\n' "${LANGS[@]}" | dedupe)
+  if [ ${#uniq[@]} -eq 1 ] && [ "${uniq[0]}" != poly ]; then
+    is_template "${uniq[0]}" || die "unknown shell '${uniq[0]}'; try: dev list"
+  else
+    require_composable "${uniq[@]}"
+  fi
+
+  if [ -e .envrc ] && [ "$FORCE" -eq 0 ]; then
+    printf '%sdev%s .envrc already exists here\n' "$A" "$R" >&2
+    hint "replace it: dev attach ${uniq[*]} -f"
+    exit 1
+  fi
+
+  local dir
+  dir=$(shell_dir "${uniq[@]}")
+  printf 'export DEV_LANGS="%s"\nuse flake %s\n' "${uniq[*]}" "$dir" >.envrc
+  git_exclude .envrc
+  direnv allow . 2>/dev/null || true
+  say "${uniq[*]} shell attached, nothing added to the repo"
+  reload_note
 }
 
 cmd_add() {
@@ -779,6 +825,24 @@ cmd_selftest() {
   t_check "  ...arg order shares one cache dir" "$d" "$(shell_dir go python)"
   t_check "wrote nothing into cwd" "yes" "$([ ! -e flake.nix ] && [ ! -e .envrc ] && [ ! -e devshell.json ] && echo yes)"
 
+  mkdir -p "$root/o" && cd "$root/o" && git init -q .
+  dev attach rust >/dev/null 2>&1 || true
+  t_check "attach writes only .envrc" "yes" "$([ -f .envrc ] && [ ! -e flake.nix ] && [ ! -e devshell.json ] && echo yes)"
+  t_check "  ...points out of tree" "$root/cache/dev/rust" "$(sed -n 's|^use flake ||p' .envrc)"
+  t_check "  ...carries DEV_LANGS" 'export DEV_LANGS="rust"' "$(head -1 .envrc)"
+  t_check "  ...git-excluded, not staged" "yes" "$(grep -qx '.envrc' .git/info/exclude && [ -z "$(git status --porcelain)" ] && echo yes)"
+  dev attach go >/dev/null 2>&1 || true
+  t_check "attach refuses over existing .envrc" "$root/cache/dev/rust" "$(sed -n 's|^use flake ||p' .envrc)"
+  dev attach go -f >/dev/null 2>&1 || true
+  t_check "attach -f replaces it" "$root/cache/dev/go" "$(sed -n 's|^use flake ||p' .envrc)"
+  t_check "  ...exclude not duplicated" "1" "$(grep -cx '.envrc' .git/info/exclude)"
+  t_check "attach poly rejected" "1" "$(dev attach poly >/dev/null 2>&1; echo $?)"
+
+  mkdir -p "$root/p" && cd "$root/p" && git init -q .
+  dev attach go python >/dev/null 2>&1 || true
+  t_check "attach poly points at shared dir" "$root/cache/dev/poly-go-python" "$(sed -n 's|^use flake ||p' .envrc)"
+  t_check "  ...carries both langs" 'export DEV_LANGS="go python"' "$(head -1 .envrc)"
+
   t_check "shell with no args rejected" "1" "$(dev shell >/dev/null 2>&1; echo $?)"
   t_check "shell poly rejected" "1" "$(dev shell poly >/dev/null 2>&1; echo $?)"
   t_check "shell unknown language rejected" "1" "$(dev shell haskell >/dev/null 2>&1; echo $?)"
@@ -806,6 +870,7 @@ usage() {
   printf '  %-22s diagnose why tooling is not working\n' "doctor"
   printf '\n'
   printf '  %-22s enter a shell without writing anything here\n' "shell <lang>..."
+  printf '  %-22s persistent shell here, nothing committable added\n' "attach <lang>..."
   printf '  %-22s scaffold flake.nix + .envrc here\n' "init <lang>..."
   printf '  %-22s add .envrc to a flake.nix you already have\n' "adopt"
   printf '  %-22s replace this directory'\''s shell\n' "switch <lang>..."
@@ -829,6 +894,7 @@ main() {
     doctor | check) cmd_doctor "$@" ;;
     init | new) cmd_init "$@" ;;
     shell) cmd_shell "$@" ;;
+    attach) cmd_attach "$@" ;;
     adopt) cmd_adopt "$@" ;;
     switch | use) cmd_switch "$@" ;;
     add) cmd_add "$@" ;;
